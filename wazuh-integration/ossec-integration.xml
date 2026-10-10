@@ -1,0 +1,8 @@
+<!-- Add inside <ossec_config> of the Wazuh manager configuration
+     (Docker: config/wazuh_cluster/wazuh_manager.conf), then restart the manager. -->
+<integration>
+  <name>custom-n8n</name>
+  <hook_url>https://N8N-HOST/webhook/wazuh-alerts</hook_url>
+  <level>10</level>
+  <alert_format>json</alert_format>
+</integration>

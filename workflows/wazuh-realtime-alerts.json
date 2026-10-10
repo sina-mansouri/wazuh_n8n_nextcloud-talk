@@ -1,0 +1,231 @@
+{
+  "name": "Wazuh → Nextcloud Talk Alerts",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wazuh-alerts",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "7dd60817-7494-4cb3-afd6-9d39da34843e",
+      "name": "Wazuh Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "ab473a79-3f35-42a8-bd4e-91214aebba92"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Einstellungen =====\nconst MIN_LEVEL = 10;            // Minimales Wazuh-Alarm-Level\nconst DEFAULT_WINDOW_MIN = 60;   // Gleicher Alarm wird so viele Minuten nicht erneut gesendet\nconst RULE_WINDOW_MIN = {        // Eigene Sperrzeit pro Regel-ID (Minuten)\n  '60602': 720,                  // Windows application error: max. alle 12 Stunden\n};\nconst IGNORE_RULES = [];         // Regel-IDs, die nie gemeldet werden, z.B. ['60602']\n\n// Speicher zwischen Ausfuehrungen (nur bei veroeffentlichtem Workflow, nicht bei manuellen Tests)\nconst store = $getWorkflowStaticData('global');\nstore.seen = store.seen || {};\nconst now = Date.now();\nfor (const k of Object.keys(store.seen)) {\n  const e = store.seen[k];\n  if (!e || typeof e !== 'object' || now - e.last_sent > 24 * 3600000) delete store.seen[k];\n}\n\n// Prueft, ob die IP oeffentlich ist (private/lokale IPs werden nicht an AbuseIPDB gesendet)\nfunction isPublic(ip) {\n  if (!ip) return false;\n  ip = ip.replace(/^::ffff:/i, '');\n  if (ip.includes(':')) {\n    const l = ip.toLowerCase();\n    return !(l === '::1' || l.startsWith('fe80') || l.startsWith('fc') || l.startsWith('fd'));\n  }\n  const p = ip.split('.').map(Number);\n  if (p.length !== 4 || p.some(isNaN)) return false;\n  if (p[0] === 10 || p[0] === 127 || p[0] === 0 || p[0] >= 224) return false;\n  if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return false;\n  if (p[0] === 192 && p[1] === 168) return false;\n  if (p[0] === 169 && p[1] === 254) return false;\n  if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return false;\n  return true;\n}\n\n// Erster sinnvoller Wert aus mehreren moeglichen Feldern\nfunction first(...vals) {\n  for (const v of vals) {\n    if (v !== undefined && v !== null && String(v).trim() !== '' && v !== '-') return String(v).trim();\n  }\n  return '';\n}\n\n// Windows-Ereignistext bereinigen und kuerzen\nfunction cleanMsg(s, max = 450) {\n  if (!s) return '';\n  s = String(s).replace(/^\"|\"$/g, '').replace(/\\\\r|\\\\n|\\r|\\n|\\\\t|\\t/g, ' ').replace(/\\s{2,}/g, ' ').trim();\n  return s.length > max ? s.slice(0, max) + ' ...' : s;\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const a = item.json.body || item.json;\n  const rule = a.rule || {};\n  const agent = a.agent || {};\n  const data = a.data || {};\n  const win = data.win || {};\n  const ev = win.eventdata || {};\n  const sys = win.system || {};\n\n  const level = Number(rule.level || 0);\n  const ruleId = String(rule.id || '');\n  if (level < MIN_LEVEL) continue;                 // Level zu niedrig -> ignorieren\n  if (IGNORE_RULES.includes(ruleId)) continue;     // Regel steht auf der Ignorierliste\n\n  // Angreifer-/Quell-IP aus Linux- und Windows-Feldern\n  const srcip = first(data.srcip, data.src_ip, ev.ipAddress, ev.sourceAddress, ev.sourceNetworkAddress);\n\n  // Duplikate unterdruecken und mitzaehlen\n  const key = `${ruleId}|${agent.name}|${srcip}`;\n  const windowMs = (RULE_WINDOW_MIN[ruleId] ?? DEFAULT_WINDOW_MIN) * 60000;\n  const entry = store.seen[key];\n  if (entry && now - entry.last_sent < windowMs) {\n    entry.count = (entry.count || 0) + 1;\n    continue;\n  }\n  const suppressed = entry ? (entry.count || 0) : 0;\n  store.seen[key] = { last_sent: now, count: 0 };\n\n  const mitre = rule.mitre || {};\n  const actorUser = first(ev.subjectUserName);\n  const actorDomain = first(ev.subjectDomainName);\n\n  out.push({ json: {\n    level,\n    rule_id: ruleId,\n    description: rule.description || '',\n    groups: (rule.groups || []).join(', '),\n    agent: agent.name || '',\n    agent_ip: agent.ip || '',\n    srcip,\n    is_public_ip: isPublic(srcip),\n    actor: actorUser ? (actorDomain ? `${actorDomain}\\\\${actorUser}` : actorUser) : first(data.srcuser),\n    target: first(ev.targetUserName, data.dstuser),\n    member: first(ev.memberName, ev.memberSid),\n    workstation: first(ev.workstationName),\n    event_id: first(sys.eventID),\n    details: cleanMsg(first(sys.message, a.full_log)),\n    mitre: (mitre.id || []).map((id, i) => `${id} ${(mitre.technique || [])[i] || ''}`.trim()).join(', '),\n    mitre_tactic: (mitre.tactic || []).join(', '),\n    location: a.location || '',\n    timestamp: a.timestamp || '',\n    window_min: windowMs / 60000,\n    suppressed,\n  }});\n}\nreturn out;\n"
+      },
+      "id": "4b7dbb78-351e-4186-bfc1-163ec5d70460",
+      "name": "Parse & Dedup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "1f061e3d-0756-4158-a58b-e085a9457c1f",
+              "leftValue": "={{ $json.is_public_ip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "34c1b987-fff3-4dbe-a989-67fa996893ef",
+      "name": "Public IP?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ipAddress",
+              "value": "={{ $json.srcip }}"
+            },
+            {
+              "name": "maxAgeInDays",
+              "value": "90"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "a4ce80d5-8ce9-4041-b9a0-2971a45a63da",
+      "name": "AbuseIPDB Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        200
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Urspruengliche Alarmdaten und AbuseIPDB-Ergebnis zusammenfuehren\nconst a = $('Parse & Dedup').item.json;\nconst abuse = $json?.data || {};\nconst score = abuse.abuseConfidenceScore;\nconst crit = a.level >= 12 || (score !== undefined && score >= 90);   // Kritisch ab Level 12 oder AbuseIPDB >= 90 %\n\n// Zeit in deutscher Ortszeit\nlet zeit = a.timestamp;\nconst d = new Date(String(a.timestamp).replace(/([+-]\\d{2})(\\d{2})$/, '$1:$2'));\nif (!isNaN(d)) zeit = d.toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });\n\nconst L = [];\nL.push(`${crit ? '🔴 **CRITICAL**' : '🟠 **Warnung**'} — Wazuh Level ${a.level}`);\nL.push(`**Regel:** ${a.description} (${a.rule_id})`);\nif (a.details) L.push(`**Was ist passiert:** ${a.details}`);\nL.push(`**Agent:** ${a.agent}${a.agent_ip ? ' (' + a.agent_ip + ')' : ''}`);\n\nif (a.srcip) {\n  let ip = `**Angreifer-/Quell-IP:** ${a.srcip}`;\n  if (a.is_public_ip) {\n    if (score !== undefined) {\n      const extra = [abuse.countryCode, abuse.isp, abuse.totalReports !== undefined ? abuse.totalReports + ' Meldungen' : '']\n        .filter(Boolean).join(', ');\n      ip += ` — AbuseIPDB: ${score}%${extra ? ' (' + extra + ')' : ''}`;\n    } else {\n      ip += ' — AbuseIPDB: n/a';\n    }\n  } else {\n    ip += ' (intern)';\n  }\n  L.push(ip);\n}\nif (a.actor)       L.push(`**Ausgeführt von:** ${a.actor}`);\nif (a.target)      L.push(`**Betroffenes Konto/Gruppe:** ${a.target}`);\nif (a.member)      L.push(`**Mitglied:** ${a.member}`);\nif (a.workstation) L.push(`**Arbeitsstation:** ${a.workstation}`);\nif (a.mitre)       L.push(`**MITRE ATT&CK:** ${a.mitre}${a.mitre_tactic ? ' — ' + a.mitre_tactic : ''}`);\nif (a.event_id)    L.push(`**Event-ID:** ${a.event_id}`);\nL.push(`**Zeit:** ${zeit}`);\nif (a.suppressed > 0) L.push(`_ℹ️ ${a.suppressed} gleiche Alarme in den letzten ${a.window_min} Min. unterdrückt._`);\n\nreturn { json: { ...a, abuse_score: score ?? null, message: L.join('\\n') } };\n"
+      },
+      "id": "8e83ea4a-85db-4bf8-9a72-19de42e1821b",
+      "name": "Build Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://NEXTCLOUD-HOST/ocs/v2.php/apps/spreed/api/v1/chat/TALK_ROOM_TOKEN",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "OCS-APIRequest",
+              "value": "true"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: $json.message }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "50dd2fae-3186-431f-bfe4-9ec9e9e90e24",
+      "name": "Send to Nextcloud Talk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Wazuh Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse & Dedup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Dedup": {
+      "main": [
+        [
+          {
+            "node": "Public IP?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Public IP?": {
+      "main": [
+        [
+          {
+            "node": "AbuseIPDB Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AbuseIPDB Check": {
+      "main": [
+        [
+          {
+            "node": "Build Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Message": {
+      "main": [
+        [
+          {
+            "node": "Send to Nextcloud Talk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
